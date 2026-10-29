@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# mock aws for tests: canned responses, no network. Profiles named teardown-sandboxNN get account 1000000000NN.
+args=(); region=""; profile=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --profile) profile=$2; shift 2 ;;
+    --region) region=$2; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+svc=${args[0]:-}; cmd=${args[1]:-}
+echo "$profile $svc $cmd $region" >>"${MOCK_LOG:-/dev/null}"
+case "$svc $cmd" in
+  "sts get-caller-identity")
+    case $profile in
+      teardown-sandbox*) echo "1000000000${profile: -2}" ;;
+      mock-via) echo 999999999999 ;;
+      *) echo 123456789012 ;;
+    esac ;;
+  "configure get") echo mock-session ;;
+  "organizations describe-organization") echo 999999999999 ;;
+  "organizations list-accounts") printf 'sandbox01\t100000000001\nsandbox02\t100000000002\nmgmt\t999999999999\nother-account\t555555555555\nsandbox99-not\t100000000099\n' ;;
+  "ec2 describe-regions") echo "us-east-1	us-west-2" ;;
+  "ec2 describe-vpcs") [[ " ${args[*]} " == *"Vpcs[0].VpcId"* ]] && { [ "$region" = us-east-1 ] && echo vpc-default || echo None; exit 0; }; [ "$region" = us-east-1 ] && cat <<J || echo '{"Vpcs":[]}'
+{"Vpcs":[{"VpcId":"vpc-default","IsDefault":true,"CidrBlock":"172.31.0.0/16"},
+ {"VpcId":"vpc-lab1","IsDefault":false,"CidrBlock":"10.0.0.0/16","Tags":[{"Key":"Name","Value":"student lab vpc"}]},
+ {"VpcId":"vpc-keep","IsDefault":false,"CidrBlock":"10.9.0.0/16","Tags":[{"Key":"Keep","Value":"true"}]}]}
+J
+    ;;
+  "ec2 describe-instances") [ "$region" = us-east-1 ] && cat <<J || echo '{"Reservations":[]}'
+{"Reservations":[{"Instances":[
+ {"InstanceId":"i-aaa","InstanceType":"t3.micro","State":{"Name":"running"},"Tags":[{"Key":"Name","Value":"web 1"}]},
+ {"InstanceId":"i-keep","InstanceType":"t3.micro","State":{"Name":"running"},"Tags":[{"Key":"Keep","Value":"true"}]}]}]}
+J
+    ;;
+  "ec2 describe-subnets") [ "$region" = us-east-1 ] && printf 'subnet-1\tvpc-lab1\t10.0.1.0/24\nsubnet-k\tvpc-keep\t10.9.1.0/24\n' ;;
+  "ec2 describe-security-groups") [ "$region" = us-east-1 ] && cat <<J
+{"SecurityGroups":[{"GroupId":"sg-1","GroupName":"web","VpcId":"vpc-lab1","IpPermissions":[{"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}],"IpPermissionsEgress":[]},
+ {"GroupId":"sg-d","GroupName":"default","VpcId":"vpc-lab1","IpPermissions":[],"IpPermissionsEgress":[]}]}
+J
+    ;;
+  "ec2 describe-internet-gateways") [ "$region" = us-east-1 ] && printf 'igw-1\tvpc-lab1\nigw-def\tvpc-default\n' ;;
+  "ec2 describe-route-tables") [ "$region" = us-east-1 ] && echo '{"RouteTables":[{"RouteTableId":"rtb-main","VpcId":"vpc-lab1","Associations":[{"Main":true}]},{"RouteTableId":"rtb-pub","VpcId":"vpc-lab1","Associations":[{"Main":false}]}]}' ;;
+  "ec2 describe-nat-gateways") if [[ " ${args[*]} " == *" --nat-gateway-ids "* ]]; then echo deleted; else [ "$region" = us-east-1 ] && printf 'nat-1\tvpc-lab1\n'; fi ;;
+  "ec2 describe-addresses") [ "$region" = us-east-1 ] && printf 'eipalloc-1\t3.3.3.3\n' ;;
+  "ec2 describe-volumes") echo '{"Volumes":[{"VolumeId":"vol-1","Size":8}]}' ;;
+  "rds describe-db-instances") [ "$region" = us-west-2 ] && printf 'db-1\tTrue\tmysql\tdb.t3.micro\n' ;;
+  "s3api list-buckets") printf 'my-student-bucket\taws-controltower-logs\tkeepme\n' ;;
+  "s3api get-bucket-tagging") [[ " ${args[*]} " == *keepme* ]] && echo true ;;
+  "iam list-roles") echo '{"Roles":[{"RoleName":"student-role","Path":"/"},{"RoleName":"AWSServiceRoleForX","Path":"/aws-service-role/x/"}]}' ;;
+  "iam list-users") echo "alice" ;;
+  "cloudformation list-stacks") [ "$region" = us-west-2 ] && echo "lab-stack" ;;
+  "lambda list-functions") [ "$region" = us-west-2 ] && echo "fn1	fn2" ;;
+  *) ;;
+esac
+exit 0

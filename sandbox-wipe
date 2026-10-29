@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# sandbox-wipe - find and delete everything left behind in the class sandbox AWS accounts.
+#
+#   ./sandbox-wipe                 interactive: asks you everything it needs
+#   ./sandbox-wipe scan  [flags]   read-only: show what is left (never deletes)
+#   ./sandbox-wipe wipe  [flags]   delete everything it finds, then re-scan to prove it is gone
+#
+# Exit codes: 0 ok/clean | 1 bad usage | 2 not logged in | 3 confirmation required | 4 resources remain
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DISCOVER="$ROOT/lib/discover.sh"
+
+for f in "$ROOT/wipe.conf" "$HOME/.config/sandbox-wipe.conf"; do [ -f "$f" ] && . "$f"; done
+
+VIA=${WIPE_VIA:-}
+REGEX=${WIPE_ACCOUNTS_REGEX:-'^sandbox[0-9]+$'}
+ROLE=${WIPE_ROLE:-TerraformStudentLabs}
+REGIONS=${WIPE_REGIONS:-us-east-1,us-east-2,us-west-1,us-west-2}
+PROTECT=${WIPE_PROTECT_REGEX:-}
+KEEP_TAG=${WIPE_KEEP_TAG:-Keep}
+OUT=${WIPE_OUT:-./out}
+DIRECT_PROFILES=()
+CMD=""
+YES=0
+VERIFY=1
+DETAILS=0
+JSON=0
+ROUNDS=2
+WAIT=30
+JOBS=4
+INTERACTIVE=1
+{ [ -t 0 ] && [ -t 1 ]; } || INTERACTIVE=0
+
+usage() {
+  cat <<EOF
+sandbox-wipe - delete everything left behind in the class sandbox AWS accounts
+
+USAGE
+  ./sandbox-wipe                      interactive mode (asks questions, explains as it goes)
+  ./sandbox-wipe scan [options]       read-only report of what is left
+  ./sandbox-wipe wipe [options]       delete it all, then re-scan to confirm
+
+WHICH ACCOUNTS (pick one way)
+  --via PROFILE         AWS SSO profile that can list the AWS Organization (required for name matching)
+  --accounts-regex RE   match accounts by NAME (default: '$REGEX')
+  --role NAME           permission set to use inside each account (default: $ROLE)
+  --profile NAME        scan this AWS profile directly instead (repeatable; skips name matching)
+
+WHAT TO SCAN
+  --regions R1,R2       regions (default: $REGIONS)
+  --keep-tag KEY        resources tagged KEY=true are never touched (default: $KEEP_TAG)
+  --protect REGEX       resource names matching this are never touched
+
+BEHAVIOUR
+  --yes                 wipe: do not ask for confirmation (REQUIRED when not run from a terminal)
+  --no-verify           wipe: skip the final re-scan
+  --rounds N            wipe: delete/re-scan passes to clear dependency errors (default: $ROUNDS)
+  --details             scan: list every resource, not just counts
+  --json                print the machine-readable summary (out/summary.json) when done
+  --out DIR             where reports go (default: $OUT)
+  --jobs N              accounts processed in parallel (default: $JOBS)
+  --non-interactive     never prompt (implied when there is no terminal)
+  -h, --help            this help
+
+Defaults can be set in ./wipe.conf or ~/.config/sandbox-wipe.conf (see wipe.conf.example)
+or with WIPE_VIA, WIPE_ACCOUNTS_REGEX, WIPE_ROLE, WIPE_REGIONS, WIPE_PROTECT_REGEX, WIPE_KEEP_TAG, WIPE_OUT.
+
+EXAMPLES
+  ./sandbox-wipe scan --via my-sso-profile
+  ./sandbox-wipe wipe --via my-sso-profile --yes --non-interactive
+EOF
+}
+
+die() { echo "ERROR: $*" >&2; exit "${2:-1}"; }
+ask() {  # ask "question" "default" -> sets REPLY
+  local d=$2
+  read -r -p "$1${d:+ [$d]}: " REPLY
+  REPLY=${REPLY:-$d}
+}
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    scan|wipe) CMD=$1; shift ;;
+    --via) VIA=$2; shift 2 ;;
+    --accounts-regex) REGEX=$2; shift 2 ;;
+    --role) ROLE=$2; shift 2 ;;
+    --profile) DIRECT_PROFILES+=("$2"); shift 2 ;;
+    --regions) REGIONS=$2; shift 2 ;;
+    --keep-tag) KEEP_TAG=$2; shift 2 ;;
+    --protect) PROTECT=$2; shift 2 ;;
+    --yes|-y) YES=1; shift ;;
+    --no-verify) VERIFY=0; shift ;;
+    --rounds) ROUNDS=$2; shift 2 ;;
+    --details) DETAILS=1; shift ;;
+    --json) JSON=1; shift ;;
+    --out) OUT=$2; shift 2 ;;
+    --jobs) JOBS=$2; shift 2 ;;
+    --non-interactive) INTERACTIVE=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+# ---------- preflight ----------
+for tool in aws jq; do
+  command -v "$tool" >/dev/null || die "'$tool' is not installed. Install it first (e.g. 'sudo apt install $tool')."
+done
+[ -x "$DISCOVER" ] || die "missing $DISCOVER"
+
+# ---------- interactive questions ----------
+if [ "$INTERACTIVE" = 1 ]; then
+  echo "=== sandbox-wipe ==="
+  if [ -z "$CMD" ]; then
+    echo "What do you want to do?"
+    echo "  1) Look at what is left in the sandboxes (safe - changes nothing)"
+    echo "  2) WIPE everything left in the sandboxes (deletes things permanently)"
+    ask "Choose 1 or 2" 1
+    case $REPLY in 1) CMD=scan ;; 2) CMD=wipe ;; *) die "please answer 1 or 2" ;; esac
+  fi
+  if [ ${#DIRECT_PROFILES[@]} -eq 0 ] && [ -z "$VIA" ]; then
+    echo
+    echo "I need an AWS login profile that is allowed to list the sandbox accounts."
+    echo "Profiles on this machine:"; aws configure list-profiles 2>/dev/null | sed 's/^/  - /'
+    ask "Which profile?" ""
+    VIA=$REPLY
+  fi
+  if [ -n "$VIA" ] && [ ${#DIRECT_PROFILES[@]} -eq 0 ]; then
+    ask "Match accounts whose NAME matches this pattern" "$REGEX"; REGEX=$REPLY
+    ask "Permission set to use inside each account" "$ROLE"; ROLE=$REPLY
+  fi
+  ask "Regions to check (comma separated)" "$REGIONS"; REGIONS=$REPLY
+fi
+
+[ -n "$CMD" ] || { usage >&2; die "choose a command: scan or wipe (or run with no arguments in a terminal)"; }
+if [ ${#DIRECT_PROFILES[@]} -eq 0 ] && [ -z "$VIA" ]; then
+  die "no accounts selected: pass --via PROFILE (to match accounts by name) or --profile NAME"
+fi
+[ "$CMD" = wipe ] && [ "$INTERACTIVE" = 0 ] && [ "$YES" = 0 ] && NEED_YES=1 || NEED_YES=0
+
+# ---------- login check ----------
+ensure_login() {
+  local p
+  for p in "$@"; do
+    aws sts get-caller-identity --profile "$p" >/dev/null 2>&1 && continue
+    if [ "$INTERACTIVE" = 1 ]; then
+      echo "You are not logged in to '$p'. Opening the AWS login (follow the browser prompt)..."
+      aws sso login --profile "$p" || die "login failed for '$p'" 2
+      aws sts get-caller-identity --profile "$p" >/dev/null 2>&1 || die "still cannot authenticate as '$p'" 2
+    else
+      die "not logged in to '$p'. Run: aws sso login --profile $p" 2
+    fi
+  done
+}
+if [ ${#DIRECT_PROFILES[@]} -gt 0 ]; then ensure_login "${DIRECT_PROFILES[@]}"; else ensure_login "$VIA"; fi
+
+# ---------- scan ----------
+DARGS=(-r "$REGIONS" -k "$KEEP_TAG" -J "$JOBS" -o "$OUT")
+[ -n "$PROTECT" ] && DARGS+=(-x "$PROTECT")
+if [ ${#DIRECT_PROFILES[@]} -gt 0 ]; then
+  for p in "${DIRECT_PROFILES[@]}"; do DARGS+=(-p "$p"); done
+else
+  DARGS+=(-a "$REGEX" --via "$VIA" --role "$ROLE")
+fi
+
+SUMMARY=""
+scan_once() {
+  "$DISCOVER" "${DARGS[@]}" || die "scan failed"
+  SUMMARY="$(cd "$OUT" && pwd)/summary.json"
+  [ -f "$SUMMARY" ] || die "scan produced no summary"
+}
+total() { jq '[.accounts[] | select(.status=="ok") | .destroyable] | add // 0' "$SUMMARY"; }
+manual_total() { jq '[.accounts[] | select(.status=="ok") | .manual] | add // 0' "$SUMMARY"; }
+show_details() {
+  jq -r '.accounts[] | select(.status=="ok") | .profile as $p | .resources[] | [$p, .region, .type, .id, .detail] | @tsv' "$SUMMARY" | column -t -s$'\t'
+}
+show_overview() {
+  echo
+  echo "---- Summary ----"
+  jq -r '.accounts[] | if .status=="ok" then "  \(.profile): \(.destroyable) to delete\(if .manual>0 then ", \(.manual) to review by hand (IAM/etc)" else "" end)" else "  \(.profile): SKIPPED (\(.reason))" end' "$SUMMARY"
+  echo "  TOTAL to delete: $(total)"
+}
+
+finish() { [ "$JSON" = 1 ] && cat "$SUMMARY"; }
+
+if [ "$CMD" = scan ]; then
+  scan_once
+  show_overview
+  [ "$DETAILS" = 1 ] && { echo; show_details; }
+  echo; echo "Full report: $SUMMARY"
+  finish
+  [ "$(total)" -eq 0 ] && exit 0 || exit 4
+fi
+
+# ---------- wipe ----------
+confirmed=0
+for round in $(seq 1 "$ROUNDS"); do
+  echo; echo "##### Scan, pass $round of $ROUNDS"
+  scan_once
+  n=$(total)
+  if [ "$n" -eq 0 ]; then
+    echo; echo "Nothing left to delete. The sandboxes are clean."
+    [ "$(manual_total)" -gt 0 ] && echo "(Some items need review by hand - see $SUMMARY, entries typed MANUAL:*)"
+    finish; exit 0
+  fi
+  show_overview
+
+  if [ "$confirmed" = 0 ]; then
+    if [ "$DETAILS" = 1 ] || [ "$NEED_YES" = 1 ]; then echo; show_details; fi
+    if [ "$NEED_YES" = 1 ]; then
+      echo; echo "Refusing to delete without confirmation. Re-run with --yes to proceed." >&2
+      finish; exit 3
+    elif [ "$YES" = 0 ]; then
+      echo
+      echo "!! This will PERMANENTLY DELETE the $n resources above (instances, networks, S3 buckets and their contents)."
+      echo "!! Anything tagged ${KEEP_TAG}=true is left alone. This cannot be undone."
+      echo "   (Run './sandbox-wipe scan --details' first if you want to see the full list.)"
+      read -r -p "Type WIPE (all capitals) to continue, anything else cancels: " ans
+      [ "$ans" = WIPE ] || { echo "Cancelled. Nothing was deleted."; exit 0; }
+    fi
+    confirmed=1
+  fi
+
+  echo; echo "##### Deleting, pass $round"
+  while IFS=$'\t' read -r dir acct prof; do
+    ( "$dir/destroy.sh" --execute --confirm "$acct" >"$dir/execute.log" 2>&1
+      echo "  finished $prof ($(grep -c 'FAILED' "$dir/execute.log") failed commands; log: $dir/execute.log)" ) &
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.5; done
+  done < <(jq -r '.accounts[] | select(.status=="ok" and .destroyable>0) | [.dir, .account, .profile] | @tsv' "$SUMMARY")
+  wait
+
+  [ "$VERIFY" = 0 ] && { echo "Skipped verification (--no-verify)."; finish; exit 0; }
+  if [ "$round" -lt "$ROUNDS" ]; then echo "Waiting ${WAIT}s for AWS to finish deleting dependencies..."; sleep "$WAIT"; fi
+done
+
+echo; echo "##### Final verification scan"
+scan_once
+n=$(total)
+if [ "$n" -eq 0 ]; then
+  echo; echo "Done. The sandboxes are clean."; finish; exit 0
+fi
+show_overview
+echo; show_details
+echo; echo "Some resources remain. Wait a few minutes and run './sandbox-wipe wipe' again; see execute.log files under $OUT for errors." >&2
+finish; exit 4

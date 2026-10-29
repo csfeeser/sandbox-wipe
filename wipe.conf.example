@@ -1,0 +1,7 @@
+# Copy to wipe.conf (ignored by git) or ~/.config/sandbox-wipe.conf and edit.
+WIPE_VIA=my-sso-profile
+#WIPE_ACCOUNTS_REGEX='^sandbox[0-9]+$'
+#WIPE_ROLE=TerraformStudentLabs
+#WIPE_REGIONS=us-east-1,us-east-2,us-west-1,us-west-2
+#WIPE_PROTECT_REGEX=
+#WIPE_KEEP_TAG=Keep

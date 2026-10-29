@@ -1,0 +1,5 @@
+out/
+out-*/
+*.log
+wipe.conf
+.DS_Store
