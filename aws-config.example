@@ -1,0 +1,12 @@
+# One-time AWS login setup. Add this to the END of ~/.aws/config (create the file if it does not exist):
+#     mkdir -p ~/.aws && cat aws-config.example >> ~/.aws/config
+# These are organisation-specific values (not secrets). Edit them if your SSO portal differs.
+[sso-session alta3-sandbox-creator]
+sso_start_url = https://alta3.awsapps.com/start
+sso_region = us-east-1
+sso_registration_scopes = sso:account:access
+
+[profile sandbox-creator]
+sso_session = alta3-sandbox-creator
+sso_account_id = 893134765360
+sso_role_name = StudentSandboxCreator

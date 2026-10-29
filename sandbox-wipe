@@ -13,6 +13,7 @@ DISCOVER="$ROOT/lib/discover.sh"
 
 for f in "$ROOT/wipe.conf" "$HOME/.config/sandbox-wipe.conf"; do [ -f "$f" ] && . "$f"; done
 
+DEFAULT_VIA=sandbox-creator
 VIA=${WIPE_VIA:-}
 REGEX=${WIPE_ACCOUNTS_REGEX:-'^sandbox[0-9]+$'}
 ROLE=${WIPE_ROLE:-TerraformStudentLabs}
@@ -42,7 +43,7 @@ USAGE
   ./sandbox-wipe wipe [options]       delete it all, then re-scan to confirm
 
 WHICH ACCOUNTS (pick one way)
-  --via PROFILE         AWS SSO profile that can list the AWS Organization (required for name matching)
+  --via PROFILE         AWS SSO profile that can list the AWS Organization (default: $DEFAULT_VIA)
   --accounts-regex RE   match accounts by NAME (default: '$REGEX')
   --role NAME           permission set to use inside each account (default: $ROLE)
   --profile NAME        scan this AWS profile directly instead (repeatable; skips name matching)
@@ -67,8 +68,8 @@ Defaults can be set in ./wipe.conf or ~/.config/sandbox-wipe.conf (see wipe.conf
 or with WIPE_VIA, WIPE_ACCOUNTS_REGEX, WIPE_ROLE, WIPE_REGIONS, WIPE_PROTECT_REGEX, WIPE_KEEP_TAG, WIPE_OUT.
 
 EXAMPLES
-  ./sandbox-wipe scan --via my-sso-profile
-  ./sandbox-wipe wipe --via my-sso-profile --yes --non-interactive
+  ./sandbox-wipe scan --non-interactive
+  ./sandbox-wipe wipe --non-interactive --yes
 EOF
 }
 
@@ -122,7 +123,7 @@ if [ "$INTERACTIVE" = 1 ]; then
     echo
     echo "I need an AWS login profile that is allowed to list the sandbox accounts."
     echo "Profiles on this machine:"; aws configure list-profiles 2>/dev/null | sed 's/^/  - /'
-    ask "Which profile?" ""
+    ask "Which profile?" "$DEFAULT_VIA"
     VIA=$REPLY
   fi
   if [ -n "$VIA" ] && [ ${#DIRECT_PROFILES[@]} -eq 0 ]; then
@@ -133,9 +134,7 @@ if [ "$INTERACTIVE" = 1 ]; then
 fi
 
 [ -n "$CMD" ] || { usage >&2; die "choose a command: scan or wipe (or run with no arguments in a terminal)"; }
-if [ ${#DIRECT_PROFILES[@]} -eq 0 ] && [ -z "$VIA" ]; then
-  die "no accounts selected: pass --via PROFILE (to match accounts by name) or --profile NAME"
-fi
+[ ${#DIRECT_PROFILES[@]} -eq 0 ] && [ -z "$VIA" ] && VIA=$DEFAULT_VIA
 [ "$CMD" = wipe ] && [ "$INTERACTIVE" = 0 ] && [ "$YES" = 0 ] && NEED_YES=1 || NEED_YES=0
 
 # ---------- login check ----------
