@@ -1,5 +1,7 @@
+.venv/
+__pycache__/
+.pytest_cache/
 out/
 out-*/
 *.log
 wipe.conf
-.DS_Store
