@@ -9,6 +9,8 @@ OUTDIR="./out"
 KEEP_TAG="Keep"
 MAXJOBS=6
 ACCOUNT_JOBS=4
+SERVICES=all
+ALL_SERVICES="cfn asg eks ec2 elb rds serverless s3 iam"
 ACCOUNTS_REGEX=""
 VIA=""
 ROLE="TerraformStudentLabs"
@@ -32,6 +34,10 @@ Usage: $0 (-p PROFILE ... | -a REGEX --via PROFILE) [options]
                           (default protects Control Tower / SSO / CDK bootstrap names)
   -j, --jobs N            Regions scanned in parallel per account (default: 6)
   -J, --account-jobs N    Accounts scanned in parallel (default: 4)
+  -s, --services LIST     Only scan these service groups (default: all). Fewer groups = much faster.
+                          Groups: cfn asg eks ec2 elb rds serverless s3 iam
+                          ec2 = servers, disks, networks (VPC, subnets, NAT, ...); serverless = lambda,
+                          dynamodb, sqs, sns, ecr; elb = load balancers.
 
 Output, per account, in DIR/<account-id>-<profile>/:
   inventory.tsv   every resource found (region, type, id, detail)
@@ -49,6 +55,7 @@ while [ $# -gt 0 ]; do
     -x|--protect) PROTECT_REGEX=$2; shift 2 ;;
     -j|--jobs) MAXJOBS=$2; shift 2 ;;
     -J|--account-jobs) ACCOUNT_JOBS=$2; shift 2 ;;
+    -s|--services) SERVICES=${2//,/ }; shift 2 ;;
     -a|--accounts-regex) ACCOUNTS_REGEX=$2; shift 2 ;;
     --via) VIA=$2; shift 2 ;;
     --role) ROLE=$2; shift 2 ;;
@@ -56,6 +63,11 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option: $1" >&2; usage 1 ;;
   esac
 done
+if [ "$SERVICES" != all ]; then
+  for sv in $SERVICES; do
+    [[ " $ALL_SERVICES " == *" $sv "* ]] || { echo "unknown service group '$sv' (valid: $ALL_SERVICES)" >&2; exit 1; }
+  done
+fi
 for tool in aws jq; do command -v "$tool" >/dev/null || { echo "$tool not found" >&2; exit 1; }; done
 
 if [ -n "$ACCOUNTS_REGEX" ]; then
@@ -91,6 +103,7 @@ q() { aws --profile "$PROFILE" --region "$R" "$@" 2>>"$D/err" </dev/null; }
 emit_line() { local f=$1; shift; { printf 'run'; printf ' %q' "$@"; printf '\n'; } >>"$f"; }
 e() { local p=$1; shift; emit_line "$D/phase.$p" aws --profile "$PROFILE" --region "$R" "$@"; }
 note() { printf '%s\t%s\t%s\t%s\n' "${NOTE_REGION:-$R}" "$1" "$2" "$3" >>"$D/inv"; }
+svc() { [ "$SERVICES" = all ] || [[ " $SERVICES " == *" $1 "* ]]; }
 is_protected() { [ -n "$PROTECT_REGEX" ] && [[ ${1##*[/:]} =~ $PROTECT_REGEX ]]; }
 is_kept_vpc() { [ -n "$1" ] && [[ $KEEP_VPCS == *" $1 "* ]]; }
 names() { tr '\t' '\n' | while read -r n; do
@@ -99,10 +112,17 @@ names() { tr '\t' '\n' | while read -r n; do
 
 discover_region() {
   local defvpc id nm typ st arn a b c prot eng cls vpc cidr ip alloc gb perm egr hasin hasegr s u
-  defvpc=$(q ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
-  [ "$defvpc" = None ] && defvpc=""
-  KEEP_VPCS=" $(q ec2 describe-vpcs --output json | jq -r --arg k "$KEEP_TAG" "$JQ_DEFS"'.Vpcs[] | select(kept) | .VpcId' | tr '\n' ' ') "
+  local vpcs_json="" defvpc=""
+  KEEP_VPCS=" "
+  if svc ec2; then
+    vpcs_json=$(q ec2 describe-vpcs --output json)
+    defvpc=$(jq -r '[.Vpcs[] | select(.IsDefault)][0].VpcId // empty' <<<"$vpcs_json")
+    KEEP_VPCS=" $(jq -r --arg k "$KEEP_TAG" "$JQ_DEFS"'.Vpcs[] | select(kept) | .VpcId' <<<"$vpcs_json" | tr '\n' ' ') "
+  fi
+  # Without the VPC list we cannot tell default/kept VPCs apart, so skip anything network-related.
+  local netok=0; svc ec2 && [ -n "$vpcs_json" ] && netok=1
 
+  if svc cfn; then
   # CloudFormation stacks (03/04) - top-level only; deleting them removes what they own
   q cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE ROLLBACK_COMPLETE \
       CREATE_FAILED UPDATE_ROLLBACK_COMPLETE DELETE_FAILED ROLLBACK_FAILED UPDATE_ROLLBACK_FAILED \
@@ -113,14 +133,18 @@ discover_region() {
     e 03 cloudformation delete-stack --stack-name "$s"
     e 04 cloudformation wait stack-delete-complete --stack-name "$s"
   done
+  fi
 
+  if svc asg; then
   # Auto Scaling groups (05) - must go first or they respawn instances
   q autoscaling describe-auto-scaling-groups --query 'AutoScalingGroups[].AutoScalingGroupName' --output text | names |
   while read -r s; do
     note autoscaling-group "$s" ""
     e 05 autoscaling delete-auto-scaling-group --auto-scaling-group-name "$s" --force-delete
   done
+  fi
 
+  if svc eks; then
   # EKS (06-09)
   q eks list-clusters --query 'clusters[]' --output text | names |
   while read -r c; do
@@ -134,7 +158,9 @@ discover_region() {
     e 08 eks delete-cluster --name "$c"
     e 09 eks wait cluster-deleted --name "$c"
   done
+  fi
 
+  if svc ec2; then
   # EC2 instances (10/11)
   q ec2 describe-instances --filters 'Name=instance-state-name,Values=pending,running,stopping,stopped' --output json |
     jq -r --arg k "$KEEP_TAG" "$JQ_DEFS"'.Reservations[].Instances[] | select(kept|not)
@@ -145,7 +171,9 @@ discover_region() {
     e 10 ec2 terminate-instances --instance-ids "$id"
     e 11 ec2 wait instance-terminated --instance-ids "$id"
   done
+  fi
 
+  if svc elb; then
   # Load balancers (14-17)
   q elbv2 describe-load-balancers --query 'LoadBalancers[].[LoadBalancerArn,Type,LoadBalancerName]' --output text |
   while IFS=$'\t' read -r arn typ nm; do
@@ -166,7 +194,9 @@ discover_region() {
     note target-group "$nm" "$arn"
     e 17 elbv2 delete-target-group --target-group-arn "$arn"
   done
+  fi
 
+  if svc rds; then
   # RDS (19-26)
   q rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DeletionProtection,Engine,DBInstanceClass]' --output text |
   while IFS=$'\t' read -r id prot eng cls; do
@@ -190,7 +220,9 @@ discover_region() {
   while read -r a; do note rds-cluster-snapshot "$a" ""; e 25 rds delete-db-cluster-snapshot --db-cluster-snapshot-identifier "$a"; done
   q rds describe-db-subnet-groups --query 'DBSubnetGroups[].DBSubnetGroupName' --output text | names | grep -v '^default' |
   while read -r a; do note rds-subnet-group "$a" ""; e 26 rds delete-db-subnet-group --db-subnet-group-name "$a"; done
+  fi
 
+  if [ "$netok" = 1 ]; then
   # NAT gateways + VPC endpoints (27-29)
   q ec2 describe-nat-gateways --filter Name=state,Values=pending,available --query 'NatGateways[].[NatGatewayId,VpcId]' --output text |
   while IFS=$'\t' read -r id vpc; do
@@ -206,7 +238,9 @@ discover_region() {
     note vpc-endpoint "$id" "$nm"
     e 29 ec2 delete-vpc-endpoints --vpc-endpoint-ids "$id"
   done
+  fi
 
+  if svc ec2; then
   # Elastic IPs (31)
   q ec2 describe-addresses --query 'Addresses[].[AllocationId,PublicIp]' --output text |
   while IFS=$'\t' read -r alloc ip; do
@@ -214,7 +248,9 @@ discover_region() {
     note elastic-ip "$alloc" "$ip"
     e 31 ec2 release-address --allocation-id "$alloc"
   done
+  fi
 
+  if svc serverless; then
   # Serverless / messaging / registries (35-39)
   q lambda list-functions --query 'Functions[].FunctionName' --output text | names |
   while read -r a; do note lambda "$a" ""; e 35 lambda delete-function --function-name "$a"; done
@@ -226,7 +262,9 @@ discover_region() {
   while read -r a; do note sns-topic "${a##*:}" "$a"; e 38 sns delete-topic --topic-arn "$a"; done
   q ecr describe-repositories --query 'repositories[].repositoryName' --output text | names |
   while read -r a; do note ecr-repository "$a" ""; e 39 ecr delete-repository --repository-name "$a" --force; done
+  fi
 
+  if svc ec2; then
   # AMIs, snapshots, unattached volumes (41-43)
   q ec2 describe-images --owners self --query 'Images[].[ImageId,Name]' --output text |
   while IFS=$'\t' read -r id nm; do
@@ -244,7 +282,9 @@ discover_region() {
     is_protected "$nm" && continue
     note ebs-volume "$id" "${gb}GB $nm"; e 43 ec2 delete-volume --volume-id "$id"
   done
+  fi
 
+  if [ "$netok" = 1 ]; then
   # Networking (55-80): non-default VPCs and what lives in them
   q ec2 describe-network-interfaces --filters Name=status,Values=available --query 'NetworkInterfaces[].[NetworkInterfaceId,VpcId]' --output text |
   while IFS=$'\t' read -r id vpc; do
@@ -287,24 +327,27 @@ discover_region() {
     [ -z "$id" ] && continue; is_kept_vpc "$vpc" && continue
     note network-acl "$id" "$vpc"; e 74 ec2 delete-network-acl --network-acl-id "$id"
   done
-  q ec2 describe-vpcs --output json |
-    jq -r --arg k "$KEEP_TAG" "$JQ_DEFS"'.Vpcs[] | select(.IsDefault|not) | select(kept|not) | [.VpcId, .CidrBlock, nm] | @tsv' |
+  jq -r --arg k "$KEEP_TAG" "$JQ_DEFS"'.Vpcs[] | select(.IsDefault|not) | select(kept|not) | [.VpcId, .CidrBlock, nm] | @tsv' <<<"$vpcs_json" |
   while IFS=$'\t' read -r id cidr nm; do
     is_protected "$nm" && continue
     note vpc "$id" "$cidr $nm"; e 80 ec2 delete-vpc --vpc-id "$id"
   done
+  fi
 
+  if [ "$netok" = 1 ]; then
   # Things this script will NOT delete but you should know about
   q ec2 describe-transit-gateways --query 'TransitGateways[?State!=`deleted`].TransitGatewayId' --output text | names |
   while read -r a; do note "MANUAL:transit-gateway" "$a" "not handled"; done
   q ec2 describe-vpc-peering-connections --filters Name=status-code,Values=active,pending-acceptance \
       --query 'VpcPeeringConnections[].VpcPeeringConnectionId' --output text | names |
   while read -r a; do note "MANUAL:vpc-peering" "$a" "not handled"; done
+  fi
 }
 
 discover_global() {
   local b loc t
   NOTE_REGION=global
+  if svc s3; then
   # S3 (85)
   q s3api list-buckets --query 'Buckets[].Name' --output text | names |
   while read -r b; do
@@ -313,12 +356,15 @@ discover_global() {
     note s3-bucket "$b" ""
     emit_line "$D/phase.85" empty_bucket "$PROFILE" "$b"
   done
+  fi
+  if svc iam; then
   # IAM: report only
   q iam list-roles --output json |
     jq -r '.Roles[] | select(.Path|startswith("/aws-service-role/")|not) | select(.Path|startswith("/aws-reserved/")|not) | .RoleName' | names |
   while read -r b; do note "MANUAL:iam-role" "$b" "not deleted by this tool; review by hand"; done
   q iam list-users --query 'Users[].UserName' --output text | names |
   while read -r b; do note "MANUAL:iam-user" "$b" "not deleted by this tool; review by hand"; done
+  fi
 }
 
 write_destroy_script() {

@@ -67,13 +67,16 @@ What do you want to do?
 Choose 1 or 2 [1]:
 ```
 Type `1` and press Enter. For every other question, just press Enter to accept the
-suggestion in `[brackets]`.
+suggestion in `[brackets]`. One question asks whether to use the **fast scan**: answer `y`
+(it checks servers, disks, networks and storage, which is everything students can create
+with their role; the full scan also tries databases, Lambda and similar, and is denied on them).
 
 **Step 3. Log in if asked.** If you see `You are not logged in...`, a web browser opens.
 Sign in, click **Allow**, then return to the terminal. (If no browser opens, the terminal
 shows a web address and a short code: open the address on any device and type the code.)
 
-**Step 4. Wait.** The scan takes about **15 minutes**. Leave the window open. You will see
+**Step 4. Wait.** The scan takes about **8 minutes** with the fast scan (the default suggestion
+in Step 2's questions) or about 16 minutes with the full scan. Leave the window open. You will see
 `scanned sandbox05`, `scanned sandbox06`, ... as it goes.
 
 **Step 5. Read the summary.** It ends like this:
@@ -101,7 +104,7 @@ Type WIPE (all capitals) to continue, anything else cancels:
 ```
 Type `WIPE` and press Enter. Typing anything else cancels with nothing deleted.
 
-**Step 7. Wait again (30 to 60 minutes).** It deletes everything, waits a short while for AWS to
+**Step 7. Wait again (roughly 20 to 45 minutes).** It deletes everything, waits a short while for AWS to
 finish, scans again, and repeats once if anything is left. It ends with one of:
 
 - `Done. The sandboxes are clean.` : success.
@@ -152,7 +155,7 @@ The humans who run training classes use it because students do not clean up afte
 ### Procedure
 
 ```
-1. Run the scan:        ./sandbox-wipe scan --non-interactive --details
+1. Run the scan:        ./sandbox-wipe scan --non-interactive --fast --details
 2. Read the exit code:
      0  -> accounts are clean. Report "nothing to delete". STOP.
      2  -> not logged in. Ask the human to run:  aws sso login --profile sandbox-creator
@@ -160,7 +163,7 @@ The humans who run training classes use it because students do not clean up afte
      4  -> resources exist. Report the per-account counts (see "Reading the output"). Go to 3.
      1  -> bad usage/missing tool (aws, jq). Read stderr, fix, retry.
 3. Ask the human whether to delete. Show them the totals. Do not proceed without a clear yes.
-4. If they said yes:    ./sandbox-wipe wipe --non-interactive --yes
+4. If they said yes:    ./sandbox-wipe wipe --non-interactive --fast --yes
 5. Read the exit code:
      0  -> clean and verified. Report success.
      4  -> some resources remain (usually dependency timing). Wait ~10 minutes and repeat step 4
@@ -168,16 +171,18 @@ The humans who run training classes use it because students do not clean up afte
      2  -> login expired mid-run. Ask the human to log in, then repeat step 4.
 ```
 
-**Run time:** `scan` takes ~15 minutes; `wipe` takes 30-60 minutes. Run it in the background
-(or with a timeout of at least 90 minutes) and wait for completion. Do not kill it early.
+**Run time:** `scan --fast` takes ~8 minutes (full `scan` ~16); `wipe` takes roughly 20-60 minutes
+depending on `--fast` and how much there is to delete. Run it in the background (or with a
+timeout of at least 90 minutes) and wait for completion. Do not kill it early.
 
 ### Commands (all defaults already correct for the class accounts)
 
 | Goal | Command |
 |---|---|
-| Read-only report with every resource listed | `./sandbox-wipe scan --non-interactive --details` |
+| Read-only report with every resource listed (recommended) | `./sandbox-wipe scan --non-interactive --fast --details` |
+| Same, full scan (also probes DBs, Lambda, load balancers; ~2x slower) | `./sandbox-wipe scan --non-interactive --details` |
 | Same, plus machine-readable JSON on stdout | `./sandbox-wipe scan --non-interactive --json` |
-| Delete everything, verify (human approved) | `./sandbox-wipe wipe --non-interactive --yes` |
+| Delete everything, verify (human approved) | `./sandbox-wipe wipe --non-interactive --fast --yes` |
 | Preview what a wipe would delete, without deleting | `./sandbox-wipe wipe --non-interactive` (exits `3`, deletes nothing) |
 | Limit to some regions | add `--regions us-east-1,us-east-2` |
 | Protect names from deletion | add `--protect '^name-regex'` |
@@ -225,6 +230,8 @@ After every run, `out/summary.json` (path is printed) contains:
 
 ### What it can and cannot see (tell the human when relevant)
 
+- `--fast` scans only servers, disks, networks (VPC) and S3. That equals everything the default
+  student role can see; if the human gives you a broader `--role`, use the full scan instead.
 - Only the scanned regions (default `us-east-1,us-east-2,us-west-1,us-west-2`).
 - Only what the permission set can read. The default role (`TerraformStudentLabs`) was denied on
   RDS, load balancers, Lambda, DynamoDB, IAM, CloudFormation and others. For those services,
@@ -246,6 +253,8 @@ After every run, `out/summary.json` (path is printed) contains:
 | `--accounts-regex RE` | Which accounts, by name (default `^sandbox[0-9]+$`) |
 | `--role NAME` | SSO permission set used inside each account (default `TerraformStudentLabs`) |
 | `--profile NAME` | Use an AWS profile directly (repeatable); skips name matching |
+| `--fast` | Only scan servers, disks, networks (VPC) and S3 buckets: about 2x faster. Same as `--services ec2,s3` |
+| `--services LIST` | Choose service groups: `cfn asg eks ec2 elb rds serverless s3 iam` (default: all) |
 | `--regions a,b` | Regions to check |
 | `--keep-tag KEY` | Resources tagged `KEY=true` are never touched (default `Keep`) |
 | `--protect REGEX` | Resource names matching this are never touched |

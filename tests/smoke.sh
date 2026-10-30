@@ -35,4 +35,20 @@ dry=$("$d/destroy.sh" 2>&1)
 check "destroy.sh dry-run by default" 'grep -q "DRY RUN" <<<"$dry"'
 check "destroy.sh refuses wrong confirmation" '! "$d/destroy.sh" --execute --confirm 000000000000 >/dev/null 2>&1'
 
+# 5. --fast / --services only scan the chosen groups
+"$W" scan --via mock-via --non-interactive --fast --out "$T/o5" --regions us-east-1,us-west-2 >/dev/null 2>&1
+types5=$(jq -r '.accounts[].resources[].type' "$T/o5/summary.json" | sort -u | tr '\n' ' ')
+check "--fast still finds ec2 + s3 resources" 'grep -q ec2-instance <<<"$types5" && grep -q s3-bucket <<<"$types5" && grep -q vpc <<<"$types5"'
+check "--fast skips lambda/rds/cloudformation" '! grep -qE "lambda|rds|cloudformation" <<<"$types5"'
+"$W" scan --via mock-via --non-interactive --services s3 --out "$T/o6" --regions us-east-1 >/dev/null 2>&1
+types6=$(jq -r '.accounts[].resources[].type' "$T/o6/summary.json" | sort -u | tr '\n' ' ')
+check "--services s3 finds only buckets" '[ "$types6" = "s3-bucket " ]'
+out=$("$W" scan --via mock-via --non-interactive --services bogus --out "$T/o7" 2>&1); rc=$?
+check "unknown service group is rejected" '[ $rc -ne 0 ] && grep -q "unknown service group" <<<"$out"'
+
+# 6. fail closed: if the VPC lookup fails, never emit network deletions (could hit default/kept VPCs)
+MOCK_FAIL_VPCS=1 "$W" scan --via mock-via --non-interactive --out "$T/o8" --regions us-east-1 >/dev/null 2>&1
+check "VPC lookup failure => no network deletes generated" '! grep -qE "delete-vpc|delete-subnet|internet-gateway|delete-nat|delete-security-group" "$T"/o8/*/destroy.sh'
+check "VPC lookup failure => instances still handled" 'grep -q terminate-instances "$T"/o8/*/destroy.sh'
+
 [ $fail -eq 0 ] && echo "ALL PASSED" || { echo "SOME TESTS FAILED"; exit 1; }

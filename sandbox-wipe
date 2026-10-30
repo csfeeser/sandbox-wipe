@@ -20,6 +20,8 @@ ROLE=${WIPE_ROLE:-TerraformStudentLabs}
 REGIONS=${WIPE_REGIONS:-us-east-1,us-east-2,us-west-1,us-west-2}
 PROTECT=${WIPE_PROTECT_REGEX:-}
 KEEP_TAG=${WIPE_KEEP_TAG:-Keep}
+SERVICES=${WIPE_SERVICES:-}
+FAST_ASKED=0
 OUT=${WIPE_OUT:-./out}
 DIRECT_PROFILES=()
 CMD=""
@@ -50,6 +52,10 @@ WHICH ACCOUNTS (pick one way)
 
 WHAT TO SCAN
   --regions R1,R2       regions (default: $REGIONS)
+  --fast                about 2x faster (~8 min instead of ~16): only check servers, disks, networks (VPC) and S3 buckets.
+                        Skips services the student role cannot access anyway (RDS, Lambda, load
+                        balancers, ...). Same as --services ec2,s3.
+  --services LIST       choose service groups yourself: cfn asg eks ec2 elb rds serverless s3 iam
   --keep-tag KEY        resources tagged KEY=true are never touched (default: $KEEP_TAG)
   --protect REGEX       resource names matching this are never touched
 
@@ -88,6 +94,8 @@ while [ $# -gt 0 ]; do
     --role) ROLE=$2; shift 2 ;;
     --profile) DIRECT_PROFILES+=("$2"); shift 2 ;;
     --regions) REGIONS=$2; shift 2 ;;
+    --fast) SERVICES=ec2,s3; FAST_ASKED=1; shift ;;
+    --services) SERVICES=$2; FAST_ASKED=1; shift 2 ;;
     --keep-tag) KEEP_TAG=$2; shift 2 ;;
     --protect) PROTECT=$2; shift 2 ;;
     --yes|-y) YES=1; shift ;;
@@ -131,6 +139,14 @@ if [ "$INTERACTIVE" = 1 ]; then
     ask "Permission set to use inside each account" "$ROLE"; ROLE=$REPLY
   fi
   ask "Regions to check (comma separated)" "$REGIONS"; REGIONS=$REPLY
+  if [ "$FAST_ASKED" = 0 ] && [ -z "$SERVICES" ]; then
+    echo
+    echo "Fast scan checks only servers, disks, networks and S3 storage (about twice as quick)."
+    echo "Full scan also checks databases, load balancers, Lambda, etc. (the student role cannot create those)."
+    fastdef=y; [ "$ROLE" = TerraformStudentLabs ] || fastdef=n
+    ask "Use the fast scan? (y/n)" "$fastdef"
+    case $REPLY in [Yy]*) SERVICES=ec2,s3 ;; esac
+  fi
 fi
 
 [ -n "$CMD" ] || { usage >&2; die "choose a command: scan or wipe (or run with no arguments in a terminal)"; }
@@ -156,6 +172,7 @@ if [ ${#DIRECT_PROFILES[@]} -gt 0 ]; then ensure_login "${DIRECT_PROFILES[@]}"; 
 # ---------- scan ----------
 DARGS=(-r "$REGIONS" -k "$KEEP_TAG" -J "$JOBS" -o "$OUT")
 [ -n "$PROTECT" ] && DARGS+=(-x "$PROTECT")
+[ -n "$SERVICES" ] && DARGS+=(-s "$SERVICES")
 if [ ${#DIRECT_PROFILES[@]} -gt 0 ]; then
   for p in "${DIRECT_PROFILES[@]}"; do DARGS+=(-p "$p"); done
 else

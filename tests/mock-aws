@@ -10,6 +10,7 @@ while [ $# -gt 0 ]; do
 done
 svc=${args[0]:-}; cmd=${args[1]:-}
 echo "$profile $svc $cmd $region" >>"${MOCK_LOG:-/dev/null}"
+if [ "$svc $cmd" = "ec2 describe-vpcs" ] && [ -n "${MOCK_FAIL_VPCS:-}" ]; then echo "AccessDenied" >&2; exit 255; fi
 case "$svc $cmd" in
   "sts get-caller-identity")
     case $profile in
